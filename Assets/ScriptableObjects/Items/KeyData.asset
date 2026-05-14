@@ -1,0 +1,20 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a8434cf1826002c4b89152d7b6d13b1e, type: 3}
+  m_Name: KeyData
+  m_EditorClassIdentifier: Assembly-CSharp::ItemData
+  itemName: "\u041A\u043B\u044E\u0447"
+  icon: {fileID: 1694913177206695654, guid: 2b4d62ca311331c4594c0f1ce27ba062, type: 3}
+  description: "\u041A\u043B\u044E\u0447"
+  itemType: 3
+  value: 1
+  worldPrefab: {fileID: 3300546821208749011, guid: 1262cd4b49b8d7a40b1305b548230434, type: 3}
