@@ -129,6 +129,25 @@ public class StandController : MonoBehaviour
         SetMode(standData != null ? standData.defaultMode : StandMode.Attached);
     }
 
+    // ──────────────────────────────────────────
+    // Реестр активного стенда игрока
+    //
+    // Мир (AbilityGate и др.) находит стенд игрока без прямой ссылки —
+    // player и stand это разные объекты, а ссылки player→stand нет.
+    // Побеждает последний включённый: для одиночного стенда это он и есть.
+    // Когда появятся параллельные аватары (Джозеф⇄Фуми) — заменить на
+    // реестр с ключом активного управления.
+    // ──────────────────────────────────────────
+
+    public static StandController PlayerStand { get; private set; }
+
+    private void OnEnable()  => PlayerStand = this;
+
+    private void OnDisable()
+    {
+        if (PlayerStand == this) PlayerStand = null;
+    }
+
     private void OnDestroy()
     {
         if (_embodiment == null) return;
@@ -535,6 +554,34 @@ public class StandController : MonoBehaviour
     // ──────────────────────────────────────────
     // Способности (1, 2, 3)
     // ──────────────────────────────────────────
+
+    /// <summary>
+    /// Объединённая маска тегов всех способностей активного стенда.
+    /// Пусто (None), если стенда/способностей нет.
+    /// </summary>
+    public AbilityTag CurrentAbilityTags
+    {
+        get
+        {
+            if (standData == null) return AbilityTag.None;
+
+            AbilityTag mask = AbilityTag.None;
+            foreach (var ability in standData.abilities)
+                if (ability != null)
+                    mask |= ability.tags;
+            return mask;
+        }
+    }
+
+    /// <summary>
+    /// Есть ли у активного стенда данный тег способности.
+    /// Основа гейтинга мира — мир спрашивает тег, а не имя стенда.
+    /// </summary>
+    public bool HasAbilityTag(AbilityTag tag)
+    {
+        if (tag == AbilityTag.None) return true; // «ничего не требуется» — всегда пройдёт
+        return (CurrentAbilityTags & tag) == tag;
+    }
 
     /// <summary>Активировать способность по индексу (0, 1, 2)</summary>
     public void UseAbility(int index)
