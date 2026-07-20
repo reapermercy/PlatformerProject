@@ -2,8 +2,16 @@ using UnityEngine;
 using UnityEngine.Events;
 
 /// <summary>
-/// Основной контроллер стенда игрока.
-/// Режимы: Attached (скрыт), Free (управляется мышью), Automatic (AI), SemiAuto.
+/// Координатор стенда игрока.
+///
+/// После шага 1 миграции контроллер отвечает за СУЩНОСТЬ: данные, режимы,
+/// способности, боёвку, взаимодействия и внешний API. Всё, что касается ТЕЛА
+/// (позиция, движение, поводок, видимость, флип), живёт в IStandEmbodiment —
+/// сейчас это FollowerEmbodiment.
+///
+/// Внешний API не менялся: имена и сигнатуры публичных методов прошиты
+/// в Player.prefab через UnityEvent по строкам — переименование их порвёт.
+///
 /// Живёт на отдельном GameObject, physics layer "StandGhost".
 /// HP привязаны к PlayerStats через DamageHandler.
 /// </summary>
@@ -68,40 +76,17 @@ public class StandController : MonoBehaviour
     // Состояние
     // ──────────────────────────────────────────
 
-    private StandMode  _currentMode;
+    private StandMode   _currentMode;
     private Rigidbody2D _rb;
     private Collider2D  _collider;
     private PlayerStats _ownerStats;
+    private Animator    _anim;
 
-    // Движение в Free режиме
-    private Vector2 _targetPosition;
-    private bool    _isMovingToTarget;
-    private bool    _facingRight = true;
-
-    // Idle return
-    private float   _lastInputTime;
-    private bool    _isIdleReturning;
-
-    // Spring-возврат (пружинная физика для overshooting)
-    private Vector2 _springVelocity;
+    // Тело стенда
+    private IStandEmbodiment _embodiment;
 
     // Атака
     private float _attackCooldownTimer;
-
-    // Командный полёт (клик / двойной клик)
-    private bool  _isCommandFlying;
-    private bool  _commandReturnAfter;  // true = вернуться после действия, false = остаться
-    private float _returnDelayTimer;    // ожидание перед возвратом
-
-    // ──────────────────────────────────────────
-    // Animator (хэши вместо строк)
-    // ──────────────────────────────────────────
-
-    private static readonly int HashIsMoving = Animator.StringToHash("IsMoving");
-    private static readonly int HashReturn   = Animator.StringToHash("Return");
-    private static readonly int HashSummon   = Animator.StringToHash("Summon");
-    private static readonly int HashAttack   = Animator.StringToHash("Attack");
-    private static readonly int HashAbility  = Animator.StringToHash("Ability");
 
     // ──────────────────────────────────────────
     // Переиспользуемый буфер + фильтр (Unity 6 API — OverlapCircle с ContactFilter2D)
@@ -114,8 +99,6 @@ public class StandController : MonoBehaviour
     // ──────────────────────────────────────────
     // Unity
     // ──────────────────────────────────────────
-
-    private Animator _anim;
 
     private void Awake()
     {
@@ -141,7 +124,36 @@ public class StandController : MonoBehaviour
         if (standData != null)
             ApplyStandData(standData);
 
+        CreateEmbodiment();
+
         SetMode(standData != null ? standData.defaultMode : StandMode.Attached);
+    }
+
+    private void OnDestroy()
+    {
+        if (_embodiment == null) return;
+        _embodiment.OnArrived -= HandleCommandArrival;
+        _embodiment.Teardown();
+    }
+
+    /// <summary>
+    /// Собрать воплощение. Шаг 1: единственный вариант — дух за плечом.
+    /// Шаг 2+: выбор по StandData (Integrated для стенда-кожи и т.д.).
+    /// </summary>
+    private void CreateEmbodiment()
+    {
+        var tuning = new FollowerTuning
+        {
+            returnDelay     = returnDelay,
+            idleReturnDelay = idleReturnDelay,
+            idleOffset      = idleOffset,
+            springStrength  = springStrength,
+            springDamping   = springDamping,
+        };
+
+        _embodiment = new FollowerEmbodiment(tuning);
+        _embodiment.Setup(new StandBody(this, transform, _rb, _collider, visualRoot, _anim));
+        _embodiment.OnArrived += HandleCommandArrival;
     }
 
     private void Update()
@@ -156,11 +168,7 @@ public class StandController : MonoBehaviour
         TickAttackCooldown();
 
         if (_currentMode == StandMode.Free)
-        {
-            TickIdleReturn();
-            TickReturnDelay();
-            _anim?.SetBool(HashIsMoving, _isMovingToTarget || _isCommandFlying);
-        }
+            _embodiment.Tick(Time.deltaTime);
     }
 
     private void FixedUpdate()
@@ -168,19 +176,12 @@ public class StandController : MonoBehaviour
         if (_ownerStats != null && !_ownerStats.CanAct) return;
 
         if (_currentMode == StandMode.Free)
-        {
-            if (_isMovingToTarget)
-            {
-                MoveToTarget();
-                // Командный полёт: проверяем прибытие сразу после MoveToTarget
-                if (_isCommandFlying && !_isMovingToTarget)
-                    HandleCommandArrival();
-            }
-            else if (_isIdleReturning)
-                SpringMoveToTarget();
-            else
-                EnforceRadiusLeash(); // стенд стоит на месте — следим за игроком
-        }
+            _embodiment.FixedTick(Time.fixedDeltaTime);
+    }
+
+    private void LateUpdate()
+    {
+        _embodiment?.LateTick(Time.deltaTime);
     }
 
     // ──────────────────────────────────────────
@@ -203,8 +204,9 @@ public class StandController : MonoBehaviour
     /// <summary>Установить владельца (вызывается при инициализации)</summary>
     public void SetOwner(PlayerController playerController)
     {
-        owner        = playerController.transform;
-        ownerContext  = playerController.Context;
+        ownerPlayerController = playerController;
+        owner                 = playerController.transform;
+        ownerContext          = playerController.Context;
     }
 
     // ──────────────────────────────────────────
@@ -214,23 +216,22 @@ public class StandController : MonoBehaviour
     /// <summary>Переключить режим стенда</summary>
     public void SetMode(StandMode newMode)
     {
-        StandMode prevMode = _currentMode;
         _currentMode = newMode;
 
-        switch (newMode)
+        // Attached — тело убрано; остальные режимы — тело в мире.
+        // Automatic/SemiAuto пока не тикают воплощение (AI ещё нет),
+        // как и было до выделения тела.
+        if (newMode == StandMode.Attached)
         {
-            case StandMode.Attached:
-                EnterAttached();
-                break;
-            case StandMode.Free:
-                EnterFree();
-                break;
-            case StandMode.Automatic:
-                EnterAutomatic();
-                break;
-            case StandMode.SemiAuto:
-                EnterSemiAuto();
-                break;
+            // При отзыве стенда — бросить предмет где он есть (игрок подберёт сам)
+            if (heldItemCollision != null && heldItemCollision.IsHoldingItem)
+                heldItemCollision.ReleaseItem();
+
+            _embodiment.OnDismiss();
+        }
+        else
+        {
+            _embodiment.OnSummon();
         }
 
         // Синхронизируем контекст игрока
@@ -253,98 +254,55 @@ public class StandController : MonoBehaviour
     }
 
     // ──────────────────────────────────────────
-    // Attached — стенд скрыт, слит с персонажем
-    // ──────────────────────────────────────────
-
-    private void EnterAttached()
-    {
-        // При отзыве стенда — бросить предмет где он есть (игрок подберёт сам)
-        if (heldItemCollision != null && heldItemCollision.IsHoldingItem)
-            heldItemCollision.ReleaseItem();
-
-        _anim?.SetTrigger(HashReturn);
-
-        if (visualRoot != null)
-            visualRoot.SetActive(false);
-
-        _isMovingToTarget = false;
-
-        // Стенд следует за владельцем
-        if (owner != null)
-            transform.position = owner.position;
-
-        // Отключить коллайдер (стенд не получает урон в Attached)
-        if (_collider != null)
-            _collider.enabled = false;
-    }
-
-    // ──────────────────────────────────────────
-    // Free — управляется мышью, виден
-    // ──────────────────────────────────────────
-
-    private void EnterFree()
-    {
-        if (visualRoot != null)
-            visualRoot.SetActive(true);
-
-        _anim?.SetTrigger(HashSummon);
-
-        // Появляется рядом с владельцем
-        if (owner != null)
-            transform.position = owner.position;
-
-        // Включить коллайдер
-        if (_collider != null)
-            _collider.enabled = true;
-    }
-
-    // ──────────────────────────────────────────
-    // Automatic / SemiAuto — заглушки для будущего AI
-    // ──────────────────────────────────────────
-
-    private void EnterAutomatic()
-    {
-        if (visualRoot != null)
-            visualRoot.SetActive(true);
-        if (_collider != null)
-            _collider.enabled = true;
-    }
-
-    private void EnterSemiAuto()
-    {
-        if (visualRoot != null)
-            visualRoot.SetActive(true);
-        if (_collider != null)
-            _collider.enabled = true;
-    }
-
-    // ──────────────────────────────────────────
-    // Движение (Free режим)
+    // Команды движения (внешний API — имена прошиты в префабе)
     // ──────────────────────────────────────────
 
     /// <summary>Hold ПКМ — ручное управление к позиции курсора</summary>
-    public void SetTargetPosition(Vector2 worldPos)
-    {
-        _isCommandFlying  = false;
-        _targetPosition   = ClampToRadius(worldPos);
-        _isMovingToTarget = true;
-        _isIdleReturning  = false;
-        _springVelocity   = Vector2.zero;
-        _lastInputTime    = Time.time;
-    }
+    public void SetTargetPosition(Vector2 worldPos) => _embodiment?.MoveTo(worldPos);
 
     /// <summary>Hold ПКМ отпущен</summary>
-    public void StopMoving()
-    {
-        _isMovingToTarget = false;
-        _lastInputTime    = Time.time;
-    }
+    public void StopMoving() => _embodiment?.StopMoving();
 
     /// <summary>1 клик ПКМ — лететь к точке, выполнить действие, остаться там</summary>
-    public void CommandFlyToAndReturn(Vector2 worldPos)  => StartCommand(worldPos, returnAfter: false);
+    public void CommandFlyToAndReturn(Vector2 worldPos) => StartCommand(worldPos, returnAfter: false);
 
     /// <summary>2 клика ПКМ — лететь к точке, выполнить действие, вернуться к игроку</summary>
-    public void CommandFlyToAndStay(Vector2 worldPos)    => StartCommand(worldPos, returnAfter: true);
+    public void CommandFlyToAndStay(Vector2 worldPos) => StartCommand(worldPos, returnAfter: true);
+
+    private void StartCommand(Vector2 worldPos, bool returnAfter)
+    {
+        if (_currentMode != StandMode.Free) return;
+        _embodiment?.CommandFlyTo(worldPos, returnAfter);
+    }
+
+    /// <summary>
+    /// Стенд долетел до точки команды — решаем, что там делать.
+    /// Вызывается воплощением через OnArrived.
+    /// </summary>
+    private void HandleCommandArrival()
+    {
+        // Повернуться к ближайшему врагу и атаковать
+        FaceNearestEnemy();
+        bool attacked = TryAttackNow();
+
+        // Если врагов нет — попробовать захват или взаимодействие
+        if (attacked) return;
+
+        bool wasHolding = heldItemCollision != null && heldItemCollision.IsHoldingItem;
+
+        // Хватаем только если руки пусты
+        if (!wasHolding)
+            heldItemCollision?.TryGrabNearest();
+
+        bool justGrabbed = !wasHolding
+                         && heldItemCollision != null
+                         && heldItemCollision.IsHoldingItem;
+
+        // Взаимодействие — только если ничего не подобрали только что
+        // (иначе стенд хватал бы ключ и сразу открывал бы дверь)
+        if (!justGrabbed)
+            TryInteractWithNearest();
+    }
 
     /// <summary>
     /// ЛКМ при зажатом ПКМ:
@@ -357,78 +315,12 @@ public class StandController : MonoBehaviour
 
         if (heldItemCollision != null && heldItemCollision.IsHoldingItem)
         {
-            Vector2 dir = (worldPos - (Vector2)transform.position).normalized;
+            Vector2 dir = (worldPos - Position).normalized;
             ThrowHeldItem(dir);
         }
         else
         {
             heldItemCollision?.TryGrabNearest();
-        }
-    }
-
-    private void StartCommand(Vector2 worldPos, bool returnAfter)
-    {
-        if (_currentMode != StandMode.Free) return;
-
-        _isCommandFlying    = true;
-        _commandReturnAfter = returnAfter;
-        // Командный полёт летит точно в точку клика — без офсета курсора
-        _targetPosition     = ClampToRadius(worldPos);
-        _isMovingToTarget   = true;
-        _isIdleReturning    = false;
-        _springVelocity     = Vector2.zero;
-        _lastInputTime      = Time.time;
-    }
-
-    private void HandleCommandArrival()
-    {
-        _isCommandFlying = false;
-
-        // Повернуться к ближайшему врагу и атаковать
-        FaceNearestEnemy();
-        bool attacked = TryAttackNow();
-
-        // Если врагов нет — попробовать захват или взаимодействие
-        if (!attacked)
-        {
-            bool wasHolding = heldItemCollision != null && heldItemCollision.IsHoldingItem;
-
-            // Хватаем только если руки пусты
-            if (!wasHolding)
-                heldItemCollision?.TryGrabNearest();
-
-            bool justGrabbed = !wasHolding
-                             && heldItemCollision != null
-                             && heldItemCollision.IsHoldingItem;
-
-            // Взаимодействие — только если ничего не подобрали только что
-            // (иначе стенд хватал бы ключ и сразу открывал бы дверь)
-            if (!justGrabbed)
-                TryInteractWithNearest();
-        }
-
-        if (_commandReturnAfter)
-        {
-            // Возврат с задержкой — стенд успевает выполнить действие
-            _returnDelayTimer = returnDelay;
-        }
-        else
-        {
-            // Остаться — сбрасываем таймер чтобы idle-return не сработал сразу
-            _lastInputTime = Time.time;
-        }
-    }
-
-    private void TickReturnDelay()
-    {
-        if (_returnDelayTimer <= 0f) return;
-
-        _returnDelayTimer -= Time.deltaTime;
-        if (_returnDelayTimer <= 0f)
-        {
-            _isIdleReturning = true;
-            _springVelocity  = Vector2.zero;
-            _targetPosition  = GetBehindPlayerPosition();
         }
     }
 
@@ -438,7 +330,7 @@ public class StandController : MonoBehaviour
         if (standData == null) return false;
 
         float   radius = standData.combatConfig.attackRadius * 1.5f;
-        Vector2 origin = attackPoint != null ? (Vector2)attackPoint.position : (Vector2)transform.position;
+        Vector2 origin = attackPoint != null ? (Vector2)attackPoint.position : Position;
 
         s_overlapFilter.SetLayerMask(enemyLayers);
         int count = Physics2D.OverlapCircle(origin, radius, s_overlapFilter, s_overlapBuffer);
@@ -527,141 +419,6 @@ public class StandController : MonoBehaviour
         return true;
     }
 
-    private void MoveToTarget()
-    {
-        // Перезажимаем цель в текущий радиус — игрок мог отойти пока стенд летел
-        _targetPosition = ClampToRadius(_targetPosition);
-
-        float speed     = standData != null ? standData.combatConfig.moveSpeed : 10f;
-        Vector2 current = _rb.position;
-        // Зажимаем итоговую позицию в радиус — один MovePosition за кадр, нет конфликта с leash
-        Vector2 newPos  = ClampToRadius(Vector2.MoveTowards(current, _targetPosition, speed * Time.fixedDeltaTime));
-        _rb.MovePosition(newPos);
-
-        // Флип по горизонтальному направлению движения
-        float dx = _targetPosition.x - current.x;
-        if (dx > 0.05f && !_facingRight)  Flip();
-        if (dx < -0.05f && _facingRight)  Flip();
-
-        // Достигли цели — остановиться
-        if (Vector2.Distance(newPos, _targetPosition) < 0.05f)
-        {
-            _isMovingToTarget = false;
-            _isIdleReturning  = false;
-        }
-    }
-
-    /// <summary>
-    /// Пружинное движение к цели — проскакивает чуть дальше и возвращается.
-    /// Используется при idle-возврате за спину игрока.
-    /// </summary>
-    private void SpringMoveToTarget()
-    {
-        // Цель idle-возврата обновляем каждый кадр — игрок ведь движется
-        _targetPosition = GetBehindPlayerPosition();
-
-        Vector2 current    = _rb.position;
-        Vector2 toTarget   = _targetPosition - current;
-
-        // Сила пружины к цели
-        Vector2 springForce = toTarget * springStrength;
-
-        // Затухание — убираем скорость пропорционально
-        _springVelocity += springForce * Time.fixedDeltaTime;
-        _springVelocity *= Mathf.Clamp01(1f - springDamping * Time.fixedDeltaTime);
-
-        Vector2 newPos = ClampToRadius(current + _springVelocity * Time.fixedDeltaTime);
-        _rb.MovePosition(newPos);
-
-        // Флип по направлению движения
-        float dx = _springVelocity.x;
-        if (dx > 0.1f && !_facingRight) Flip();
-        if (dx < -0.1f && _facingRight) Flip();
-
-        // Остановились — завершить возврат
-        if (toTarget.magnitude < 0.05f && _springVelocity.magnitude < 0.05f)
-        {
-            _springVelocity  = Vector2.zero;
-            _isIdleReturning = false;
-        }
-    }
-
-    private void Flip()
-    {
-        _facingRight = !_facingRight;
-        if (visualRoot != null)
-        {
-            Vector3 s = visualRoot.transform.localScale;
-            s.x *= -1f;
-            visualRoot.transform.localScale = s;
-        }
-    }
-
-    /// <summary>Зажать точку внутри maxRadius от владельца</summary>
-    private Vector2 ClampToRadius(Vector2 target)
-    {
-        if (owner == null || standData == null) return target;
-        Vector2 ownerPos = (Vector2)owner.position;
-        Vector2 delta    = target - ownerPos;
-        if (delta.magnitude <= standData.maxRadius) return target;
-        return ownerPos + delta.normalized * standData.maxRadius;
-    }
-
-    // ──────────────────────────────────────────
-    // Idle Return — возврат за спину игрока
-    // ──────────────────────────────────────────
-
-    private void TickIdleReturn()
-    {
-        if (_isMovingToTarget)  return;
-        if (_isIdleReturning)   return;
-        if (_isCommandFlying)   return; // во время команды не запускаем авто-возврат
-
-        if (Time.time - _lastInputTime >= idleReturnDelay)
-        {
-            _targetPosition  = GetBehindPlayerPosition();
-            _isIdleReturning = true;
-        }
-    }
-
-    /// <summary>Позиция за плечом игрока в зависимости от направления взгляда</summary>
-    private Vector2 GetBehindPlayerPosition()
-    {
-        if (owner == null) return _rb.position;
-
-        // Противоположная сторона от взгляда
-        float facingSign = (ownerPlayerController != null && ownerPlayerController.FacingRight)
-            ? -1f   // смотрит вправо → стенд слева
-            : 1f;   // смотрит влево  → стенд справа
-
-        Vector2 offset = new Vector2(facingSign * idleOffset.x, idleOffset.y);
-        return ClampToRadius((Vector2)owner.position + offset);
-    }
-
-    // ──────────────────────────────────────────
-
-    // ──────────────────────────────────────────
-    // RadiusLeash — плавный возврат если игрок ушёл
-    // ──────────────────────────────────────────
-
-    /// <summary>
-    /// Вызывается только когда стенд стоит на месте (не движется к цели).
-    /// Если игрок ушёл дальше maxRadius — запускаем пружинный возврат.
-    /// MovePosition НЕ вызывается — нет конфликта с MoveToTarget.
-    /// </summary>
-    private void EnforceRadiusLeash()
-    {
-        if (owner == null || standData == null) return;
-
-        float dist = Vector2.Distance(_rb.position, (Vector2)owner.position);
-        if (dist <= standData.maxRadius) return;
-
-        // Запустить плавный возврат к позиции за спиной игрока
-        _isIdleReturning = true;
-        _springVelocity  = Vector2.zero;
-        _targetPosition  = GetBehindPlayerPosition();
-    }
-
     /// <summary>Бросить удерживаемый предмет в направлении курсора.</summary>
     public void ThrowHeldItem(Vector2 direction, float force = 8f)
     {
@@ -670,7 +427,7 @@ public class StandController : MonoBehaviour
     }
 
     // ──────────────────────────────────────────
-    // Атака стенда (ПКМ клик в Free)
+    // Атака стенда (ЛКМ при зажатом ПКМ в Free)
     // ──────────────────────────────────────────
 
     /// <summary>
@@ -691,7 +448,7 @@ public class StandController : MonoBehaviour
             if (TryInteractWithNearest()) return;
 
             // Рядом нет подходящей цели → бросить в сторону курсора
-            Vector2 dir = (worldPos - (Vector2)transform.position).normalized;
+            Vector2 dir = (worldPos - Position).normalized;
             ThrowHeldItem(dir);
             return;
         }
@@ -735,12 +492,10 @@ public class StandController : MonoBehaviour
 
         FaceNearestEnemy();
 
-        float   radius    = standData != null ? standData.combatConfig.attackRadius    : 0.8f;
-        int     damage    = standData != null ? standData.combatConfig.baseDamage      : 12;
-        float   knockback = standData != null ? standData.combatConfig.knockbackForce  : 3f;
-        Vector2 origin    = attackPoint != null
-            ? (Vector2)attackPoint.position
-            : (Vector2)transform.position;
+        float   radius    = standData != null ? standData.combatConfig.attackRadius   : 0.8f;
+        int     damage    = standData != null ? standData.combatConfig.baseDamage     : 12;
+        float   knockback = standData != null ? standData.combatConfig.knockbackForce : 3f;
+        Vector2 origin    = attackPoint != null ? (Vector2)attackPoint.position : Position;
 
         s_overlapFilter.SetLayerMask(enemyLayers);
         int count = Physics2D.OverlapCircle(origin, radius, s_overlapFilter, s_overlapBuffer);
@@ -761,7 +516,7 @@ public class StandController : MonoBehaviour
         }
 
         _attackCooldownTimer = standData != null ? standData.combatConfig.attackCooldown : 0.3f;
-        _anim?.SetTrigger(HashAttack);
+        _anim?.SetTrigger(StandAnimHashes.Attack);
         OnStandAttack?.Invoke();
     }
 
@@ -791,20 +546,22 @@ public class StandController : MonoBehaviour
         if (ability == null) return;
 
         FaceNearestEnemy();
-        _anim?.SetTrigger(HashAbility);
+        _anim?.SetTrigger(StandAnimHashes.Ability);
 
         if (ability.TryExecute(this))
             OnAbilityUsed?.Invoke(index);
     }
 
-    // ──────────────────────────────────────────
-    // Attached mode — следовать за владельцем
-    // ──────────────────────────────────────────
-
-    private void LateUpdate()
+    /// <summary>
+    /// Мгновенно повернуть стенд лицом к ближайшему врагу.
+    /// Вызывается перед атакой и активацией способностей.
+    /// </summary>
+    public void FaceNearestEnemy()
     {
-        if (_currentMode == StandMode.Attached && owner != null)
-            transform.position = owner.position;
+        Collider2D nearest = Physics2D.OverlapCircle(transform.position, 15f, enemyLayers);
+        if (nearest == null) return;
+
+        _embodiment?.FaceTowards(nearest.transform.position.x);
     }
 
     // ──────────────────────────────────────────
@@ -833,13 +590,14 @@ public class StandController : MonoBehaviour
     // Публичные свойства
     // ──────────────────────────────────────────
 
-    public StandMode  CurrentMode        => _currentMode;
-    public StandData  Data               => standData;
-    public Transform  Owner              => owner;
-    public Vector2    Position           => (Vector2)transform.position;
-    public bool       IsMovingToTarget   => _isMovingToTarget;
-    public LayerMask  EnemyLayers        => enemyLayers;
-    public Vector2    MouseWorldPosition => _mouseWorldPosition;
+    public StandMode        CurrentMode        => _currentMode;
+    public StandData        Data               => standData;
+    public Transform        Owner              => owner;
+    public PlayerController OwnerController    => ownerPlayerController;
+    public Vector2          Position           => (Vector2)transform.position;
+    public bool             IsMovingToTarget   => _embodiment != null && _embodiment.IsMoving;
+    public LayerMask        EnemyLayers        => enemyLayers;
+    public Vector2          MouseWorldPosition => _mouseWorldPosition;
 
     private Vector2 _mouseWorldPosition;
 
@@ -849,18 +607,4 @@ public class StandController : MonoBehaviour
     /// Используется ProjectileAbility для направления снаряда.
     /// </summary>
     public void UpdateMousePosition(Vector2 worldPos) => _mouseWorldPosition = worldPos;
-
-    /// <summary>
-    /// Мгновенно повернуть стенд лицом к ближайшему врагу.
-    /// Вызывается перед атакой и активацией способностей.
-    /// </summary>
-    public void FaceNearestEnemy()
-    {
-        Collider2D nearest = Physics2D.OverlapCircle(transform.position, 15f, enemyLayers);
-        if (nearest == null) return;
-
-        float dx = nearest.transform.position.x - transform.position.x;
-        if (dx > 0.01f && !_facingRight) Flip();
-        else if (dx < -0.01f && _facingRight) Flip();
-    }
 }
