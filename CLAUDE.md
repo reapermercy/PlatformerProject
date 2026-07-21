@@ -1,38 +1,84 @@
-# SpiritBound → JoJo Metroidvania — контекст проекта
+# JoJo Metroidvania — контекст проекта
 
 ## Что это
-2D метроидвания на Unity (fan-проект по JoJo's Bizarre Adventure и
-оригинальной манге владельца «Путь падающей звезды»). Герой управляется
-клавиатурой, его стенд — вторым слоем управления (фокус/мышь).
-Двенадцать планируемых протагонистов, каждый — свой жанровый режим.
+2D-игра на Unity 6 (fan-проект по JoJo's Bizarre Adventure и оригинальной
+манге владельца «Путь падающей звезды»). Герой управляется клавиатурой,
+его стенд — вторым слоем управления (мышь).
 
-## Текущее состояние кодбейса
-Рабочие системы: StandController, StandSwitchManager, база StandAbility,
-FSM врагов, SharedHealthSystem (общее HP героя и духа, поводок 5м,
-дух с предметом теряет фазирование), интерактивы (рычаги/двери/диалоги/
-записки), Save/Load, ScoreManager, UI. Есть модули персонажей на
-CharacterBus (событийная шина: герой и стенд не ссылаются друг на друга).
+**Форма игры.** Главы, в каждой играем за своего протагониста со своим
+набором механик (планируется двенадцать). Внутри главы игрок видит
+прогрессию сил персонажа и постепенно осваивает новые механики.
 
-## Целевая архитектура (спроектирована, скелеты в docs/stand-system/)
-Ядро: СТЕНД = Сущность (данные/логика, без позиции) + Воплощение
-(IStandEmbodiment: как существует в мире). Воплощения: Follower,
-Integrated (кожа), Autonomous, Deployable, Swarm, Overhead, Vine, Unseen.
-Команды StandCommand — общий язык инпута, AI и тел (ездят по CharacterBus).
-Способности — модули IStandAbility с тегами AbilityTag; гейтинг мира
-через HasAbilityTag, никогда через имя персонажа.
-Общие подсистемы: TimeAuthority (единое время: заморозка объекта/
-существа/мира, exempt-списки), ObservationRegistry (кто на что смотрит),
-DamageChannel (Physical/Stand/Hamon/Spin), StealableProperty (свойства
-как компоненты), Rewindable (история состояний), RhythmEngine.
+**Основа геймплея — схватки со стенд-юзерами, чаще всего 1 на 1.** Бой
+не обязан быть боем: он может быть головоломкой (понять принцип чужого
+стенда), погоней, побегом — это переменная величина от главы к главе.
+Между схватками — интерактивные сцены: диалоги, катсцены, союзники
+(джобро), которые сопровождают героя.
 
-## План миграции (шаги оставляют игру запускаемой)
-1. IStandEmbodiment внутрь StandController → StandController худеет до
-   координатора; текущий дух = PhasingFollowerEmbodiment. Ничего снаружи
-   не ломается.
-2. Теги в базу StandAbility + один AbilityGate на карте (проверка гейтинга).
-3. TimeAuthority вместо точечных заморозок/хитстопа.
-4. ObservationRegistry — только когда дойдёт очередь Джорджа (самый
-   тяжёлый кусок; кэшировать видимость, не рейкастить каждый кадр).
+## Что РЕАЛЬНО есть в коде (Assets/Scripts)
+Игрок: `PlayerController` (движение, прыжок с coyote/buffer, присед,
+лазанье, блок), `PlayerStats` (единственный источник HP, неуязвимость,
+смерть), `PlayerCombat` (комбо на 3 удара, блок, парирование с контрой),
+`PlayerContext` (контейнер состояния), `EnergySystem` (Хамон/Спин).
+
+Стенд: `StandController` (координатор) + `IStandEmbodiment`/
+`FollowerEmbodiment` (тело), `StandData`/`CharacterData`/`StandAbility`
+(SO-данные), `StandInputHandler`, `StandSwitchManager` + `StandCondition`,
+`HeldItemCollision`, `StandProjectile`. Способности: `RapidPunchAbility`,
+`ProjectileAbility`, `TimeStopAbility`.
+
+Урон: `DamageHandler` маршрутизирует в `PlayerStats` или `EnemyStats`,
+`enum DamageSource {Human, Stand, Vampire, Hazard, Hamon, Script}`.
+Правило «человек не бьёт стенд» — там же. **Общее HP героя и духа**
+сделано проводкой: у игрока и у стенда `DamageHandler` смотрит в один
+`PlayerStats` (отдельного класса под это нет).
+
+Враги: `EnemyAI` (FSM: Idle/Patrol/Chase/Attack/Staggered/Dead),
+`FlyingEnemyAI`, `EnemyStats`, `enum EnemyType {Human, Vampire, StandUser,
+Stand, Zombie}`, `ZombieRevive`. Бой: `StatusEffect*` (эффекты статуса).
+
+Мир: интерактивы через `IInteractable` + `InteractableRegistry` (рычаг,
+дверь, табличка, записка, диалог, подбор предмета), `Inventory`/`ItemData`,
+`Checkpoint`/`CheckpointManager`, `Hazard`, `HealthPickup`.
+
+Мета: `GameManager` (синглтон, пауза, переходы сцен), `SaveLoadManager`
+(слоты, JSON), `ScoreManager`, `LevelStartup`/`LevelExit`, `CameraController`,
+`CharacterRegistry`. UI: меню, пауза, HUD, health/energy bar, инвентарь,
+диалоговые пузыри (`WorldBubble`/`DialogueBubble`), записки, результаты,
+экран смерти, индикатор стенда, иконки способностей.
+
+Сцены: `MainMenu` + `Level1..5` + `LevelTemplate`.
+
+## Расхождение структуры (осознанное, решить)
+Мета-слой написан под **уровневый скоринговый платформер**: `LevelExit`
+считает бонус за время против `parTime`, `ScoreManager` копит очки,
+на пятом уровне «ИГРА ПРОЙДЕНА». Целевая форма — **повествовательные
+главы** со схватками-головоломками. Очки и par-time к бою-головоломке
+и погоне прикладываются плохо. Не переписывать молча: сначала решить,
+остаётся ли скоринг вообще.
+
+## Целевая архитектура
+Ядро: СТЕНД = Сущность (данные/логика) + Воплощение (как существует
+в мире). Воплощения: Follower, Integrated (кожа), Autonomous, Deployable,
+Swarm, Overhead, Vine, Unseen. Способности — модули с тегами `AbilityTag`;
+гейтинг мира через `HasAbilityTag`, **никогда** через имя персонажа.
+
+Спроектировано, но НЕ написано: `TimeAuthority` (единое время: заморозка
+объекта/существа/мира, exempt-списки), `ObservationRegistry` (кто на что
+смотрит), `StealableProperty` (свойства как компоненты), `Rewindable`
+(история состояний), `RhythmEngine`, команды `StandCommand`.
+
+## План миграции (каждый шаг оставляет игру запускаемой)
+1. ✅ **Сделано.** `IStandEmbodiment` выделен из `StandController`;
+   контроллер похудел до координатора, текущий дух = `FollowerEmbodiment`.
+2. ✅ **Сделано (не проверено в редакторе).** `AbilityTag` + поле `tags`
+   в `StandAbility`, `HasAbilityTag`/`CurrentAbilityTags` на контроллере,
+   компонент `AbilityGate`. Осталось: проставить теги на ассетах
+   способностей и поставить гейт на сцену.
+3. ⬜ `TimeAuthority` вместо точечных заморозок/хитстопа (сейчас
+   `TimeStopAbility` крутит корутину и трогает объекты напрямую).
+4. ⬜ `ObservationRegistry` — только когда дойдёт очередь Джорджа
+   (самый тяжёлый кусок; кэшировать видимость, не рейкастить каждый кадр).
 
 ## Ключевые правила лора (нарушать нельзя)
 - Джордж / Under Pressure: стенд ВИДИМ; ЗАМИРАЕТ под ВРАЖДЕБНЫМ взглядом
@@ -40,7 +86,7 @@ DamageChannel (Physical/Stand/Hamon/Spin), StealableProperty (свойства
   без наблюдателей и удерживают удачное состояние; ЛЮБОЙ взгляд фиксирует
   удержанное в реальность навсегда; доставка частей пулей из револьвера;
   Hey You = весь стенд в одной пуле → цель в суперпозиции. Полный свод:
-  docs/stand-system/UnderPressure_канон.md
+  docs/StandSystem/UnderPressure_канон.md
 - Джотаро / Going Underground: стенд на роликах; изначально останавливает
   время ТОЛЬКО ДЛЯ СЕБЯ (связь владелец-стенд рвётся → правило 5м не
   действует, радиус = скорость × длительность паузы). До сюжетной
@@ -65,14 +111,23 @@ DamageChannel (Physical/Stand/Hamon/Spin), StealableProperty (свойства
 - Иерархия отрицаний: остановить (Джотаро) → вернуть (Джоске) →
   отменить (GER) → отнять (Гаппи) → лишить (Go Beyond).
 
-## Известные долги скелетов при переносе в Unity
-- Корутины в не-MonoBehaviour классах → перенести в хост-компоненты.
-- FollowerEmbodiment: методы должны стать virtual/protected (наследники
-  Джолин/Джодио/роликов это предполагают).
-- Ввод переписать на новую Input System (Action Maps под фокус стенда).
-- Физика заморозок/склеек/осколков → FixedUpdate; аккуратно с
-  kinematic/dynamic переключениями.
-- IsObserved: кэш видимости с инвалидацией по движению наблюдателей.
+## Известные долги
+- `Player.prefab`: у `StandInputHandler` не назначен `standController`,
+  у `OnMouseWorldUpdated` нет слушателей → `MouseWorldPosition` всегда
+  (0,0), `ProjectileAbility` целится в начало координат. Чинится
+  в инспекторе.
+- UnityEvent'ы прошиты в префабах ПО ИМЕНАМ методов `StandController`
+  (`ToggleStand`, `SetTargetPosition`, `StopMoving`, `CommandFlyToAndReturn`,
+  `CommandFlyToAndStay`, `UseAbility`, `GrabOrThrowOrAttack`).
+  Переименование молча рвёт связи — проверять префабы при рефакторинге.
+- `FollowerEmbodiment`: методы стоит сделать virtual/protected —
+  наследники (Джолин/Джодио/ролики) это предполагают.
+- `TimeStopAbility` — корутина на `StandController`; уедет в `TimeAuthority`.
+- Скелеты в `docs/` объявляют типы-заглушки (`PlayerCombat`,
+  `TimeStopAbility`, …), конфликтующие с реальными классами. Держать
+  папку ВНЕ `Assets/`, иначе Unity не соберёт проект.
+- `DamageSource` в коде ≠ `DamageChannel` из проектной заметки
+  (Physical/Stand/Hamon/Spin). Решить, приводим ли к одному виду.
 
 ## Стиль работы с владельцем проекта
 Владелец — Влад, опытный в Unity, метод «атмосфера и интуиция сначала,
@@ -81,5 +136,5 @@ DamageChannel (Physical/Stand/Hamon/Spin), StealableProperty (свойства
 Pink Floyd, Beatles, Beach Boys) — сохранять традицию.
 
 ## Справочники
-Скелеты всех 12 персонажей: docs/stand-system/*.cs
-Канон Under Pressure: docs/stand-system/UnderPressure_канон.md
+Скелеты всех 12 персонажей: `docs/StandSystem/*.cs`
+Канон Under Pressure: `docs/StandSystem/UnderPressure_канон.md`
