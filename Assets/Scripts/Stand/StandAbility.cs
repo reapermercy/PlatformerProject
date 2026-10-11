@@ -18,6 +18,11 @@ public abstract class StandAbility : ScriptableObject
     [Header("Cooldown")]
     public float cooldown = 3f;
 
+    [Header("Gating")]
+    [Tooltip("Теги для гейтинга мира. Мир спрашивает тег, не имя стенда. " +
+             "None — способность боевая и на прохождение не влияет.")]
+    public AbilityTag tags = AbilityTag.None;
+
     // ──────────────────────────────────────────
     // Runtime (не сериализуется)
     // ──────────────────────────────────────────
